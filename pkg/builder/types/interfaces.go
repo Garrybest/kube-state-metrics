@@ -42,6 +42,7 @@ type BuilderInterface interface {
 	WithFamilyGeneratorFilter(l generator.FamilyGeneratorFilter)
 	WithAllowLabels(l map[string][]string)
 	WithGenerateStoresFunc(f BuildStoresFunc, useAPIServerCache bool)
+	WithGenerateCustomResourceStoresFunc(f BuildCustomResourceStoresFunc, useAPIServerCache bool)
 	DefaultGenerateStoresFunc() BuildStoresFunc
 	Build() []metricsstore.MetricsWriter
 	BuildStores() [][]cache.Store
@@ -51,6 +52,14 @@ type BuilderInterface interface {
 type BuildStoresFunc func(metricFamilies []generator.FamilyGenerator,
 	expectedType interface{},
 	listWatchFunc func(kubeClient clientset.Interface, ns string, fieldSelector string) cache.ListerWatcher,
+	useAPIServerCache bool,
+) []cache.Store
+
+// BuildCustomResourceStoresFunc function signature that is used to return a list of custom resource cache.Store
+type BuildCustomResourceStoresFunc func(resourceName string,
+	metricFamilies []generator.FamilyGenerator,
+	expectedType interface{},
+	listWatchFunc func(customResourceClient interface{}, ns string, fieldSelector string) cache.ListerWatcher,
 	useAPIServerCache bool,
 ) []cache.Store
 

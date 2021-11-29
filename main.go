@@ -18,283 +18,102 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"net"
-	"net/http"
-	"net/http/pprof"
-	"os"
-	"strconv"
-	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	samplev1alpha1 "k8s.io/sample-controller/pkg/apis/samplecontroller/v1alpha1"
+	clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
+
+	"k8s.io/kube-state-metrics/v2/pkg/app"
+	"k8s.io/kube-state-metrics/v2/pkg/metric"
 	generator "k8s.io/kube-state-metrics/v2/pkg/metric_generator"
-
-	"github.com/oklog/run"
-	"github.com/pkg/errors"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/version"
-	"github.com/prometheus/exporter-toolkit/web"
-	vpaclientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
-	clientset "k8s.io/client-go/kubernetes"
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/klog/v2"
-
-	"k8s.io/kube-state-metrics/v2/internal/store"
-	"k8s.io/kube-state-metrics/v2/pkg/allowdenylist"
-	"k8s.io/kube-state-metrics/v2/pkg/metricshandler"
-	"k8s.io/kube-state-metrics/v2/pkg/options"
-	"k8s.io/kube-state-metrics/v2/pkg/util/proc"
 )
-
-const (
-	metricsPath = "/metrics"
-	healthzPath = "/healthz"
-)
-
-// promLogger implements promhttp.Logger
-type promLogger struct{}
-
-func (pl promLogger) Println(v ...interface{}) {
-	klog.Error(v...)
-}
-
-// promLogger implements the Logger interface
-func (pl promLogger) Log(v ...interface{}) error {
-	klog.Info(v...)
-	return nil
-}
 
 func main() {
-	opts := options.NewOptions()
-	opts.AddFlags()
-
-	promLogger := promLogger{}
-
-	ctx := context.Background()
-
-	err := opts.Parse()
-	if err != nil {
-		klog.Fatalf("Error: %s", err)
-	}
-
-	if opts.Version {
-		fmt.Printf("%s\n", version.Print("kube-state-metrics"))
-		os.Exit(0)
-	}
-
-	if opts.Help {
-		opts.Usage()
-		os.Exit(0)
-	}
-	storeBuilder := store.NewBuilder()
-
-	ksmMetricsRegistry := prometheus.NewRegistry()
-	ksmMetricsRegistry.MustRegister(version.NewCollector("kube_state_metrics"))
-	durationVec := promauto.With(ksmMetricsRegistry).NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:        "http_request_duration_seconds",
-			Help:        "A histogram of requests for kube-state-metrics metrics handler.",
-			Buckets:     prometheus.DefBuckets,
-			ConstLabels: prometheus.Labels{"handler": "metrics"},
-		}, []string{"method"},
-	)
-	storeBuilder.WithMetrics(ksmMetricsRegistry)
-
-	var resources []string
-	if len(opts.Resources) == 0 {
-		klog.Info("Using default resources")
-		resources = options.DefaultResources.AsSlice()
-	} else {
-		klog.Infof("Using resources %s", opts.Resources.String())
-		resources = opts.Resources.AsSlice()
-	}
-
-	if err := storeBuilder.WithEnabledResources(resources); err != nil {
-		klog.Fatalf("Failed to set up resources: %v", err)
-	}
-
-	namespaces := opts.Namespaces.GetNamespaces()
-	nsFieldSelector := namespaces.GetExcludeNSFieldSelector(opts.NamespacesDenylist)
-	storeBuilder.WithNamespaces(namespaces, nsFieldSelector)
-
-	allowDenyList, err := allowdenylist.New(opts.MetricAllowlist, opts.MetricDenylist)
-	if err != nil {
-		klog.Fatal(err)
-	}
-
-	err = allowDenyList.Parse()
-	if err != nil {
-		klog.Fatalf("error initializing the allowdeny list : %v", err)
-	}
-
-	klog.Infof("metric allow-denylisting: %v", allowDenyList.Status())
-
-	storeBuilder.WithFamilyGeneratorFilter(generator.NewCompositeFamilyGeneratorFilter(
-		allowDenyList,
-	))
-
-	storeBuilder.WithGenerateStoresFunc(storeBuilder.DefaultGenerateStoresFunc(), opts.UseAPIServerCache)
-
-	proc.StartReaper()
-
-	kubeClient, vpaClient, err := createKubeClient(opts.Apiserver, opts.Kubeconfig)
-	if err != nil {
-		klog.Fatalf("Failed to create client: %v", err)
-	}
-	storeBuilder.WithKubeClient(kubeClient)
-	storeBuilder.WithVPAClient(vpaClient)
-	storeBuilder.WithSharding(opts.Shard, opts.TotalShards)
-	storeBuilder.WithAllowAnnotations(opts.AnnotationsAllowList)
-	storeBuilder.WithAllowLabels(opts.LabelsAllowList)
-
-	ksmMetricsRegistry.MustRegister(
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		collectors.NewGoCollector(),
-	)
-
-	var g run.Group
-
-	m := metricshandler.New(
-		opts,
-		kubeClient,
-		storeBuilder,
-		opts.EnableGZIPEncoding,
-	)
-	// Run MetricsHandler
-	{
-		ctxMetricsHandler, cancel := context.WithCancel(ctx)
-		g.Add(func() error {
-			return m.Run(ctxMetricsHandler)
-		}, func(error) {
-			cancel()
-		})
-	}
-
-	tlsConfig := opts.TLSConfig
-
-	telemetryMux := buildTelemetryServer(ksmMetricsRegistry)
-	telemetryListenAddress := net.JoinHostPort(opts.TelemetryHost, strconv.Itoa(opts.TelemetryPort))
-	telemetryServer := http.Server{Handler: telemetryMux, Addr: telemetryListenAddress}
-
-	metricsMux := buildMetricsServer(m, durationVec)
-	metricsServerListenAddress := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
-	metricsServer := http.Server{Handler: metricsMux, Addr: metricsServerListenAddress}
-
-	// Run Telemetry server
-	{
-		g.Add(func() error {
-			klog.Infof("Starting kube-state-metrics self metrics server: %s", telemetryListenAddress)
-			return web.ListenAndServe(&telemetryServer, tlsConfig, promLogger)
-		}, func(error) {
-			ctxShutDown, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			telemetryServer.Shutdown(ctxShutDown)
-		})
-	}
-	// Run Metrics server
-	{
-		g.Add(func() error {
-			klog.Infof("Starting metrics server: %s", metricsServerListenAddress)
-			return web.ListenAndServe(&metricsServer, tlsConfig, promLogger)
-		}, func(error) {
-			ctxShutDown, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			metricsServer.Shutdown(ctxShutDown)
-		})
-	}
-
-	if err := g.Run(); err != nil {
-		klog.Fatalf("RunGroup Error: %v", err)
-	}
-	klog.Info("Exiting")
+	app.RunKubeStateMetrics(new(FooFactory))
 }
 
-func createKubeClient(apiserver string, kubeconfig string) (clientset.Interface, vpaclientset.Interface, error) {
-	config, err := clientcmd.BuildConfigFromFlags(apiserver, kubeconfig)
-	if err != nil {
-		return nil, nil, err
-	}
+var (
+	descFooLabelsDefaultLabels = []string{"namespace", "foo"}
+)
 
-	config.UserAgent = version.Version
-	config.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
-	config.ContentType = "application/vnd.kubernetes.protobuf"
+type FooFactory struct{}
 
-	kubeClient, err := clientset.NewForConfig(config)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	vpaClient, err := vpaclientset.NewForConfig(config)
-	if err != nil {
-		return nil, nil, err
-	}
-	// Informers don't seem to do a good job logging error messages when it
-	// can't reach the server, making debugging hard. This makes it easier to
-	// figure out if apiserver is configured incorrectly.
-	klog.Infof("Testing communication with server")
-	v, err := kubeClient.Discovery().ServerVersion()
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "error while trying to communicate with apiserver")
-	}
-	klog.Infof("Running with Kubernetes cluster version: v%s.%s. git version: %s. git tree state: %s. commit: %s. platform: %s",
-		v.Major, v.Minor, v.GitVersion, v.GitTreeState, v.GitCommit, v.Platform)
-	klog.Infof("Communication with server successful")
-
-	return kubeClient, vpaClient, nil
+func (f *FooFactory) Name() string {
+	return "foos"
 }
 
-func buildTelemetryServer(registry prometheus.Gatherer) *http.ServeMux {
-	mux := http.NewServeMux()
-
-	// Add metricsPath
-	mux.Handle(metricsPath, promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: promLogger{}}))
-	// Add index
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-             <head><title>Kube-State-Metrics Metrics Server</title></head>
-             <body>
-             <h1>Kube-State-Metrics Metrics</h1>
-			 <ul>
-             <li><a href='` + metricsPath + `'>metrics</a></li>
-			 </ul>
-             </body>
-             </html>`))
-	})
-	return mux
+func (f *FooFactory) CreateClient(cfg *rest.Config) (interface{}, error) {
+	return clientset.NewForConfig(cfg)
 }
 
-func buildMetricsServer(m *metricshandler.MetricsHandler, durationObserver prometheus.ObserverVec) *http.ServeMux {
-	mux := http.NewServeMux()
+func (f *FooFactory) MetricFamilyGenerators(allowAnnotationsList, allowLabelsList []string) []generator.FamilyGenerator {
+	return []generator.FamilyGenerator{
+		*generator.NewFamilyGenerator(
+			"kube_foo_spec_replicas",
+			"Number of desired replicas for a foo.",
+			metric.Gauge,
+			"",
+			wrapFooFunc(func(f *samplev1alpha1.Foo) *metric.Family {
+				return &metric.Family{
+					Metrics: []*metric.Metric{
+						{
+							Value: float64(*f.Spec.Replicas),
+						},
+					},
+				}
+			}),
+		),
+		*generator.NewFamilyGenerator(
+			"kube_foo_status_replicas_available",
+			"The number of available replicas per foo.",
+			metric.Gauge,
+			"",
+			wrapFooFunc(func(f *samplev1alpha1.Foo) *metric.Family {
+				return &metric.Family{
+					Metrics: []*metric.Metric{
+						{
+							Value: float64(f.Status.AvailableReplicas),
+						},
+					},
+				}
+			}),
+		),
+	}
+}
 
-	// TODO: This doesn't belong into serveMetrics
-	mux.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
-	mux.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
-	mux.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
-	mux.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
-	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+func wrapFooFunc(f func(*samplev1alpha1.Foo) *metric.Family) func(interface{}) *metric.Family {
+	return func(obj interface{}) *metric.Family {
+		foo := obj.(*samplev1alpha1.Foo)
 
-	mux.Handle(metricsPath, promhttp.InstrumentHandlerDuration(durationObserver, m))
+		metricFamily := f(foo)
 
-	// Add healthzPath
-	mux.HandleFunc(healthzPath, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(http.StatusText(http.StatusOK)))
-	})
-	// Add index
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-             <head><title>Kube Metrics Server</title></head>
-             <body>
-             <h1>Kube Metrics</h1>
-			 <ul>
-             <li><a href='` + metricsPath + `'>metrics</a></li>
-             <li><a href='` + healthzPath + `'>healthz</a></li>
-			 </ul>
-             </body>
-             </html>`))
-	})
-	return mux
+		for _, m := range metricFamily.Metrics {
+			m.LabelKeys = append(descFooLabelsDefaultLabels, m.LabelKeys...)
+			m.LabelValues = append([]string{foo.Namespace, foo.Name}, m.LabelValues...)
+		}
+
+		return metricFamily
+	}
+}
+
+func (f *FooFactory) ExpectedType() interface{} {
+	return &samplev1alpha1.Foo{}
+}
+
+func (f *FooFactory) ListWatch(customResourceClient interface{}, ns string, fieldSelector string) cache.ListerWatcher {
+	client := customResourceClient.(*clientset.Clientset)
+	return &cache.ListWatch{
+		ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
+			opts.FieldSelector = fieldSelector
+			return client.SamplecontrollerV1alpha1().Foos(ns).List(context.Background(), opts)
+		},
+		WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
+			opts.FieldSelector = fieldSelector
+			return client.SamplecontrollerV1alpha1().Foos(ns).Watch(context.Background(), opts)
+		},
+	}
 }

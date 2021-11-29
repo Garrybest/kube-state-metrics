@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package main
+package app
 
 import (
 	"bytes"
@@ -28,8 +28,6 @@ import (
 	"testing"
 	"time"
 
-	generator "k8s.io/kube-state-metrics/v2/pkg/metric_generator"
-
 	"github.com/prometheus/client_golang/prometheus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -39,6 +37,7 @@ import (
 
 	"k8s.io/kube-state-metrics/v2/internal/store"
 	"k8s.io/kube-state-metrics/v2/pkg/allowdenylist"
+	generator "k8s.io/kube-state-metrics/v2/pkg/metric_generator"
 	"k8s.io/kube-state-metrics/v2/pkg/metricshandler"
 	"k8s.io/kube-state-metrics/v2/pkg/options"
 )
